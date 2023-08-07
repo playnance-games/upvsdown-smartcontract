@@ -2,9 +2,8 @@
 pragma solidity >=0.4.22 <0.9.0;
 
 import "@openzeppelin/contracts/access/Ownable.sol";
-import "@openzeppelin/contracts/utils/Strings.sol";
 
-contract UpVsDownGameV2 is Ownable {
+contract UpVsDownGameV3 is Ownable {
 
   struct BetGroup {
     uint256[] bets;
@@ -33,14 +32,19 @@ contract UpVsDownGameV2 is Ownable {
 
   struct Distribution {
     uint256 fee;
+    uint256 feeJackpot;
     uint256 totalMinusFee;
+    uint256 totalMinusJackpotFee;
+    uint256 totalFees;
     uint256 pending;
   }
 
   address public gameController;
   mapping(bytes => Round) public pools;
-  uint8 public feePercentage = 5;
-  address public feeAddress = msg.sender;
+  uint8 public feePercentage = 9;
+  uint8 public feeJackpotPercentage = 1;
+  address public feeAddress = msg.sender; //default fee address
+  address public feeJackpotAddress = msg.sender; //default fee jackpot address
   bool public isRunning;
   bytes public notRunningReason;
 
@@ -57,7 +61,8 @@ contract UpVsDownGameV2 is Ownable {
   event GameStopped(bytes reason);
   event GameStarted();
   event RoundDistributed(bytes poolId, uint totalWinners, uint from, uint to, int64 timestamp);
-  event TradeWinningsSent(bytes poolId, address sender, uint256 tradeAmount, uint256 winningsAmount, address indexed indexedSender, string whiteLabelId);
+  event TradeWinningsSent(bytes poolId, address sender, uint256 tradeAmount, uint256 winningsAmount, address indexed indexedSender, string whiteLabelId, uint8 feePercentage, uint8 feeJackpotPercentage);
+
 
   // Modifiers
 
@@ -77,7 +82,7 @@ contract UpVsDownGameV2 is Ownable {
   }
 
   modifier onlyPoolExists (bytes calldata poolId) {
-    require(pools[poolId].created == true, 'Pool does not exist');
+    require(pools[poolId].created, 'Pool does not exist');
     _;
   }
 
@@ -87,15 +92,27 @@ contract UpVsDownGameV2 is Ownable {
 
   // Methods
 
-  function changeGameControllerAddress(address newGameController) public onlyOwner {
-    gameController = newGameController;
+  function changeGameControllerAddress(address newGameControllerAddress) public onlyOwner {
+    require(newGameControllerAddress != address(0x0) , "Address cannot be zero address");
+
+    gameController = newGameControllerAddress;
   }
 
   function changeGameFeePercentage(uint8 newFeePercentage) public onlyOwner {
+    require (newFeePercentage <=100 , "Wrong fee percentage value");
+
     feePercentage = newFeePercentage;
   }
 
+  function changeGameFeeJackpotPercentage(uint8 newFeeJackpotPercentage) public onlyOwner {
+    require (newFeeJackpotPercentage <=100 , "Wrong jackpot fee percentage value");
+
+    feeJackpotPercentage = newFeeJackpotPercentage;
+  }
+
   function changeGameFeeAddress(address newFeeAddress) public onlyOwner {
+    require(newFeeAddress != address(0x0) , "Address cannot be zero address");
+
     feeAddress = newFeeAddress;
   }
 
@@ -147,6 +164,10 @@ contract UpVsDownGameV2 is Ownable {
     }
   }
 
+  function getContractBalance() public view returns (uint256) {
+    return address(this).balance;
+  }
+
   function returnBets (
     bytes calldata poolId,
     BetGroup storage group,
@@ -171,16 +192,37 @@ contract UpVsDownGameV2 is Ownable {
   ) public onlyGameController onlyPoolExists(poolId) {
     Round storage round = pools[poolId];
 
-    if (round.upBetGroup.bets.length == 0 || round.downBetGroup.bets.length == 0) {
-      BetGroup storage returnGroup = round.downBetGroup.bets.length == 0 ? round.upBetGroup : round.downBetGroup;
+    if (round.upBetGroup.bets.length == 0 || round.downBetGroup.bets.length == 0 || (round.startPrice == round.endPrice)) {
+      if (round.startPrice == round.endPrice){ //In case of TIE return the investments to both sides
+        BetGroup storage returnGroupUp = round.upBetGroup;
+        BetGroup storage returnGroupDown = round.downBetGroup;
 
-      uint fromReturn = returnGroup.distributedCount;
-      returnBets(poolId, returnGroup, batchSize);
-      emit RoundDistributed(poolId, returnGroup.bets.length, fromReturn, returnGroup.distributedCount,timeMS);
+        uint fromReturnUp = returnGroupUp.distributedCount;
+        uint fromReturnDown = returnGroupDown.distributedCount;
 
-      if (returnGroup.distributedCount == returnGroup.bets.length) {
-        clearPool(poolId);
+        returnBets(poolId, returnGroupUp, batchSize);
+        returnBets(poolId, returnGroupDown, batchSize);
+
+        emit RoundDistributed(poolId, returnGroupUp.bets.length, fromReturnUp, returnGroupUp.distributedCount,timeMS);
+        emit RoundDistributed(poolId, returnGroupDown.bets.length, fromReturnDown, returnGroupDown.distributedCount,timeMS);
+
+        if (returnGroupUp.distributedCount == returnGroupUp.bets.length && returnGroupDown.distributedCount == returnGroupDown.bets.length) {
+          clearPool(poolId);
+        }
+
+      }else{
+        BetGroup storage returnGroup = round.downBetGroup.bets.length == 0 ? round.upBetGroup : round.downBetGroup;
+
+        uint fromReturn = returnGroup.distributedCount;
+        returnBets(poolId, returnGroup, batchSize);
+        emit RoundDistributed(poolId, returnGroup.bets.length, fromReturn, returnGroup.distributedCount,timeMS);
+
+        if (returnGroup.distributedCount == returnGroup.bets.length) {
+          clearPool(poolId);
+        }
       }
+
+      
       return;
     }
 
@@ -198,9 +240,10 @@ contract UpVsDownGameV2 is Ownable {
     uint256 to = winners.distributedCount + limit;
 
     for (uint i = winners.distributedCount; i < to; i++) {
-      uint256 winnings = ((winners.bets[i] * 100 / winners.total) * dist.totalMinusFee / 100);
+      uint256 winnings = (winners.bets[i] * dist.totalFees * 100 / winners.total  / 100);
+
       sendEther(winners.addresses[i], winnings + winners.bets[i]);
-      emit TradeWinningsSent(poolId, winners.addresses[i], winners.bets[i], winnings, winners.addresses[i], winners.whiteLabelIds[i]);
+      emit TradeWinningsSent(poolId, winners.addresses[i], winners.bets[i], winnings, winners.addresses[i], winners.whiteLabelIds[i],feePercentage,feeJackpotPercentage);
       winners.totalDistributed = winners.totalDistributed + winnings;
     }
 
@@ -208,20 +251,33 @@ contract UpVsDownGameV2 is Ownable {
 
     winners.distributedCount = to;
     if (winners.distributedCount == winners.bets.length) {
-      sendEther(feeAddress, dist.fee + dist.totalMinusFee - winners.totalDistributed);
+      sendEther(feeAddress, (dist.fee + dist.totalMinusFee)*feePercentage / 100);
+      sendEther(feeJackpotAddress, (dist.feeJackpot + dist.totalMinusJackpotFee)*feeJackpotPercentage / 100);
+      //Send leftovers to fee address
+      sendEther(feeAddress,getContractBalance());
+
       clearPool(poolId);
     }
   }
 
-  function calculateDistribution (
+   function calculateDistribution (
     BetGroup storage winners,
     BetGroup storage losers
   ) private view returns (Distribution memory) {
     uint256 fee = feePercentage * losers.total / 100;
+    uint256 jackpotFee = feeJackpotPercentage * losers.total / 100;
+    uint256 totalFee = fee + jackpotFee;
     uint256 pending = winners.bets.length - winners.distributedCount;
+    uint256 totalFees = losers.total - totalFee;
+    uint256 totalMinusFee = losers.total - fee;
+    uint256 totalMinusJackpotFee = losers.total - jackpotFee;
+
     return Distribution({
       fee: fee,
-      totalMinusFee: losers.total - fee,
+      feeJackpot: jackpotFee,
+      totalMinusFee: totalMinusFee,
+      totalMinusJackpotFee: totalMinusJackpotFee,
+      totalFees: totalFees,
       pending: pending
     });
   }
